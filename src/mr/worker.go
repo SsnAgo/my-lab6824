@@ -12,10 +12,6 @@ import "log"
 import "net/rpc"
 import "hash/fnv"
 
-
-//
-// Map functions return a slice of KeyValue.
-//
 type KeyValue struct {
 	Key   string
 	Value string
@@ -23,15 +19,10 @@ type KeyValue struct {
 
 type ByKey []KeyValue
 
-// for sorting by key.
 func (a ByKey) Len() int           { return len(a) }
 func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
-//
-// use ihash(key) % NReduce to choose the reduce
-// task number for each KeyValue emitted by Map.
-//
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
@@ -39,9 +30,7 @@ func ihash(key string) int {
 }
 
 var workerId int
-//
-// main/mrworker.go calls this function.
-//
+
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 	// 1. call for work
@@ -73,17 +62,12 @@ func Worker(mapf func(string, string) []KeyValue,
 }
 
 func doreduce(reducef func(string, []string) string, reply AskWorkReply) (outfiles []string){
-	// first ensure the file
-	// reply.WorkerId means reducerId
-	// read local files like "mr-X-WorkerId"
 	filenames := reply.Filenames
 	Y := reply.TaskId
-	//fmt.Printf("do reduce task, taskfile:%v, workerId:%v, reducerId:%v\n", filenames, reply.WorkId, Y)
 	files := make([]*os.File, len(filenames))
-	// output filename
-	oname := fmt.Sprintf("mr-out-%v", Y)
-	ofile, _ := os.Create(oname)
-	//ofile, _ := ioutil.TempFile("./",oname)
+
+	oname := fmt.Sprintf("*-mr-out-%v", Y)
+	ofile, _ := ioutil.TempFile("./",oname)
 	outfiles = []string{ofile.Name()}
 
 	for i, filename := range filenames {
@@ -104,12 +88,8 @@ func doreduce(reducef func(string, []string) string, reply AskWorkReply) (outfil
 			}
 			all_kvs = append(all_kvs, kv)
 		}
+		file.Close()
 	}
-	//for _, dec := range decs {
-	//	var kv KeyValue
-	//	dec.Decode(&kv)
-	//	all_kvs = append(all_kvs, kv)
-	//}
 	sort.Sort(all_kvs)
 
 	i := 0
@@ -123,13 +103,10 @@ func doreduce(reducef func(string, []string) string, reply AskWorkReply) (outfil
 			values = append(values, all_kvs[k].Value)
 		}
 		output := reducef(all_kvs[i].Key, values)
-		// write to outfile
 		fmt.Fprintf(ofile, "%v %v\n",all_kvs[i].Key, output)
-		//fmt.Fprintf(ofile,"%v %v\n", output)
 		i = j
 	}
 	ofile.Close()
-	//fmt.Printf("reduce task done, taskfile:%v, workerId:%v, reducerId:%v, outfile:%v\n", filenames, reply.WorkId, Y, outfiles)
 	return outfiles
 
 }
@@ -139,12 +116,10 @@ func domap(mapf func(string, string) []KeyValue, reply AskWorkReply) (outfiles [
 	//workerId := reply.WorkId
 	taskId := reply.TaskId
 	nReduce := reply.NReduce
-	//fmt.Printf("do map task, taskfile:%v, workerId:%v\n", filenames, workerId)
 	// save kvsa to reduce file  create nreduce file per worker
 	mrXYs := make([]*os.File, nReduce)
 	encs := make([]*json.Encoder, nReduce)
 	// init encoder and out-files
-
 	for i := 0; i < nReduce;i++ {
 		// delete old file
 		fname := fmt.Sprintf("*-mr-%d-%d", taskId, i)
@@ -220,12 +195,6 @@ func CallForDone(doneWorkArgs DoneWorkArgs) (DoneWorkReply, error) {
 	return DoneWorkReply{}, errors.New("call done fail")
 }
 
-
-//
-// send an RPC request to the coordinator, wait for the response.
-// usually returns true.
-// returns false if something goes wrong.
-//
 func call(rpcname string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := coordinatorSock()

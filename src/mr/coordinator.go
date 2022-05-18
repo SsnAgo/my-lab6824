@@ -1,7 +1,6 @@
 package mr
 
 import (
-	"fmt"
 	"log"
 	"strconv"
 	"strings"
@@ -75,7 +74,6 @@ func (c *Coordinator) WorkSend(args *AskWorkArgs, reply *AskWorkReply) error {
 		reply.TaskType = -1
 		return nil
 	}
-
 	wid := args.WorkId
 	if wid == 0 {
 		c.idLock.Lock()
@@ -89,24 +87,22 @@ func (c *Coordinator) WorkSend(args *AskWorkArgs, reply *AskWorkReply) error {
 	} else if currentStatus == 2 {
 		task = c.getReduceTask(wid)
 	}
-	// assignment reply
-
 	// no more task
 	if task == nil {
 		reply.WorkId = wid
 		reply.TaskType = 0
 		return nil
 	}
+	// assignment reply
 	reply.NReduce = c.NReduce
 	reply.TaskType = currentStatus
 	reply.Filenames = task.taskFiles
 	reply.WorkId = wid
 	reply.TaskId = task.taskId
 
-	c.AddWorkingTask(task)
+	c.AddWorkingTask(wid, task)
 
 	// add to working task
-	fmt.Println("sendwork : ", reply)
 	return nil
 }
 
@@ -132,13 +128,11 @@ func (c *Coordinator) timeTicker() {
 
 func (c *Coordinator) WorkDone(args *DoneWorkArgs, reply *DoneWorkReply) error {
 	// done this  delete the worker from working map
-
 	if c.CurrentStatus == 1 {
 		c.mapDone(args, reply)
 	} else if c.CurrentStatus == 2 {
 		c.reduceDone(args, reply)
 	}
-	fmt.Println("one work done : ", args)
 	return nil
 }
 
@@ -158,7 +152,7 @@ func (c *Coordinator) server() {
 
 func (c *Coordinator) Done() bool {
 	// 0 means all reduce done
-	// todo: add an rpc call,
+	//
 	c.statusLock.Lock()
 	status := c.CurrentStatus
 	c.statusLock.Unlock()
@@ -266,8 +260,10 @@ func (c *Coordinator) mapDone(args *DoneWorkArgs, reply *DoneWorkReply) {
 	doneTaskId := args.TaskId
 	for _, xy := range mrXYs {
 		Y, _ := strconv.Atoi(xy[strings.LastIndex(xy, "-")+1:])
+		newname := xy[strings.Index(xy,"-")+1:]
+		os.Rename(xy, newname)
 		c.reduceTaskLock.Lock()
-		c.ReduceTasks[Y].taskFiles = append(c.ReduceTasks[Y].taskFiles, xy)
+		c.ReduceTasks[Y].taskFiles = append(c.ReduceTasks[Y].taskFiles, newname)
 		c.reduceTaskLock.Unlock()
 	}
 	// done count ++
@@ -309,7 +305,6 @@ func (c *Coordinator) checkMapDone() {
 	c.countLock.Lock()
 	defer c.countLock.Unlock()
 	if c.NMapTask == c.DoneCount {
-		fmt.Println("all map done")
 		c.DoneCount = 0
 		c.statusLock.Lock()
 		c.CurrentStatus = 2
@@ -322,9 +317,6 @@ func (c *Coordinator) checkMapDone() {
 		c.workingLock.Lock()
 		c.WorkingTasks = make([]*WorkingTask, 0)
 		c.workingLock.Unlock()
-
-
-
 	}
 }
 
@@ -332,9 +324,8 @@ func (c *Coordinator) checkReduceDone() {
 	c.countLock.Lock()
 	defer c.countLock.Unlock()
 	if c.NReduceTask == c.DoneCount {
-		fmt.Println("all reduce done")
 
-		//c.doReduceOutRename()
+		c.doReduceOutRename()
 
 		c.DoneCount = 0
 		c.statusLock.Lock()
@@ -349,8 +340,6 @@ func (c *Coordinator) checkReduceDone() {
 		c.WorkingTasks = make([]*WorkingTask, 0)
 		c.workingLock.Unlock()
 
-
-
 	}
 }
 
@@ -362,7 +351,6 @@ func (c *Coordinator) recycleMapTask() {
 		if !workingTask.free  {
 			workingTask.cost++
 			if workingTask.cost > 10 {
-				fmt.Printf("map worker: %d crashed ! cost : %v , task %v recycle\n", workingTask.worker, workingTask.cost, workingTask.task.taskFiles)
 				// mark the working task is dead
 				workingTask.free = true
 				// add into dead map
@@ -391,7 +379,6 @@ func (c *Coordinator) recycleReduceTask() {
 		if !workingTask.free  {
 			workingTask.cost++
 			if workingTask.cost > 10 {
-				fmt.Printf("reduce worker: %d crashed ! cost : %v , task %v recycle\n", workingTask.worker, workingTask.cost, workingTask.task.taskFiles)
 				// mark the working task is dead
 				workingTask.free = true
 				// add into dead map
@@ -411,7 +398,7 @@ func (c *Coordinator) recycleReduceTask() {
 	}
 }
 
-func (c *Coordinator) AddWorkingTask(task *Task) {
+func (c *Coordinator) AddWorkingTask(wid int, task *Task) {
 	c.workingLock.Lock()
 	c.freeLock.Lock()
 	// if workingfree: replace else put back
@@ -421,11 +408,13 @@ func (c *Coordinator) AddWorkingTask(task *Task) {
 		c.WorkingTasks[pos].task = task
 		c.WorkingTasks[pos].free = false
 		c.WorkingTasks[pos].cost = 0
+		c.WorkingTasks[pos].worker = wid
 	}else {
 		c.WorkingTasks = append(c.WorkingTasks, &WorkingTask{
 			free:   false,
 			task:   task,
 			cost:   0,
+			worker: wid,
 		})
 	}
 	c.freeLock.Unlock()
@@ -444,19 +433,6 @@ func (c *Coordinator) markTaskDone(doneTaskId int) {
 		}
 	}
 	c.workingLock.Unlock()
-}
-
-func (c *Coordinator) doMapOutRename() {
-	c.reduceTaskLock.Lock()
-	for i := 0; i < c.NReduce;i++ {
-		for j := 0; j < c.NMapTask;j++ {
-			oldname := c.ReduceTasks[i].taskFiles[j]
-			newname := oldname[strings.Index(oldname,"-")+1:]
-			c.ReduceTasks[i].taskFiles[j] = newname
-			os.Rename(oldname, newname)
-		}
-	}
-	c.reduceTaskLock.Unlock()
 }
 
 func (c *Coordinator) doReduceOutRename() {
