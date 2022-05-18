@@ -1,6 +1,13 @@
 package mr
 
-import "fmt"
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/ioutil"
+	"os"
+	"sort"
+)
 import "log"
 import "net/rpc"
 import "hash/fnv"
@@ -14,6 +21,13 @@ type KeyValue struct {
 	Value string
 }
 
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
 //
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
@@ -24,48 +38,188 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
+var workerId int
 //
 // main/mrworker.go calls this function.
 //
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
+	// 1. call for work
+	for {
+		//time.Sleep(time.Second)
+		reply, ok := CallForWork()
+		// ok means rpc call success
+		if !ok { continue }
+		// no task
+		if reply.TaskType == 0 { continue }
+		// coordinator exit   worker done
+		if reply.TaskType == -1 { return  }
 
-	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
-
-}
-
-//
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
-
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
+		var outfiles []string
+		if reply.TaskType == 1 {
+			outfiles = domap(mapf, reply)
+		}
+		if reply.TaskType == 2 {
+			outfiles = doreduce(reducef, reply)
+		}
+		// send message to announce workerID done, and no matter if its map or reduce
+		doneWorkArgs := DoneWorkArgs{
+			TaskId: reply.TaskId,
+			WorkerId:  workerId,
+			Filepaths: outfiles,
+		}
+		CallForDone(doneWorkArgs)
 	}
 }
+
+func doreduce(reducef func(string, []string) string, reply AskWorkReply) (outfiles []string){
+	// first ensure the file
+	// reply.WorkerId means reducerId
+	// read local files like "mr-X-WorkerId"
+	filenames := reply.Filenames
+	Y := reply.TaskId
+	//fmt.Printf("do reduce task, taskfile:%v, workerId:%v, reducerId:%v\n", filenames, reply.WorkId, Y)
+	files := make([]*os.File, len(filenames))
+	// output filename
+	oname := fmt.Sprintf("mr-out-%v", Y)
+	ofile, _ := os.Create(oname)
+	//ofile, _ := ioutil.TempFile("./",oname)
+	outfiles = []string{ofile.Name()}
+
+	for i, filename := range filenames {
+		file, err := os.Open(filename)
+		if err != nil {
+			log.Fatal("open file error : %s, err : %v\n", filename, err)
+			return
+		}
+		files[i] = file
+	}
+	all_kvs := make(ByKey, 0)
+	for _, file := range files {
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			all_kvs = append(all_kvs, kv)
+		}
+	}
+	//for _, dec := range decs {
+	//	var kv KeyValue
+	//	dec.Decode(&kv)
+	//	all_kvs = append(all_kvs, kv)
+	//}
+	sort.Sort(all_kvs)
+
+	i := 0
+	for i < len(all_kvs) {
+		j := i + 1
+		for j < len(all_kvs) && all_kvs[i].Key == all_kvs[j].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j;k++ {
+			values = append(values, all_kvs[k].Value)
+		}
+		output := reducef(all_kvs[i].Key, values)
+		// write to outfile
+		fmt.Fprintf(ofile, "%v %v\n",all_kvs[i].Key, output)
+		//fmt.Fprintf(ofile,"%v %v\n", output)
+		i = j
+	}
+	ofile.Close()
+	//fmt.Printf("reduce task done, taskfile:%v, workerId:%v, reducerId:%v, outfile:%v\n", filenames, reply.WorkId, Y, outfiles)
+	return outfiles
+
+}
+
+func domap(mapf func(string, string) []KeyValue, reply AskWorkReply) (outfiles []string) {
+	filenames := reply.Filenames
+	//workerId := reply.WorkId
+	taskId := reply.TaskId
+	nReduce := reply.NReduce
+	//fmt.Printf("do map task, taskfile:%v, workerId:%v\n", filenames, workerId)
+	// save kvsa to reduce file  create nreduce file per worker
+	mrXYs := make([]*os.File, nReduce)
+	encs := make([]*json.Encoder, nReduce)
+	// init encoder and out-files
+
+	for i := 0; i < nReduce;i++ {
+		// delete old file
+		fname := fmt.Sprintf("*-mr-%d-%d", taskId, i)
+
+		os.Remove(fname)
+		mrXY, err := ioutil.TempFile("./",fname)
+		if err != nil {
+			log.Fatal("create file error : %s, err : %v", fname, err)
+			return
+		}
+		outfiles = append(outfiles, mrXY.Name())
+		mrXYs[i] = mrXY
+		encs[i] = json.NewEncoder(mrXY)
+	}
+	defer func() {
+		for i := 0; i < nReduce;i++ {
+			mrXYs[i].Close()
+		}
+	}()
+	// read all task file and encode the content, then write to out-files
+	files := make([]*os.File, len(filenames))
+	for i, filename := range filenames {
+		file, err := os.Open(filename)
+		files[i] = file
+		if err != nil {
+			log.Fatal("cannot open %s", filename)
+			return
+		}
+		content, err := ioutil.ReadAll(file)
+		if err != nil {
+			log.Fatal("cannot read %s", filename)
+			return
+		}
+		file.Close()
+		kva := mapf(filename, string(content))
+		// write to nreduce buckets
+		// and write to file
+		for _, kv := range kva {
+			reduceId := ihash(kv.Key) % nReduce
+			encs[reduceId].Encode(&kv)
+		}
+		//fmt.Printf("one file done: %s\n", filename)
+	}
+	// close files
+	defer func() {
+		for i := 0; i < len(filenames);i++ {
+			files[i].Close()
+		}
+	}()
+	//fmt.Printf("map task done, outputfiles:%v, workerId:%v\n", outfiles, workerId)
+	return outfiles
+
+}
+
+func CallForWork() (AskWorkReply, bool) {
+	args := AskWorkArgs{workerId}
+	reply := AskWorkReply{}
+	ok := call("Coordinator.WorkSend", &args,&reply)
+	//fmt.Println(ok, reply)
+	if ok {
+		if workerId == 0 { workerId = reply.WorkId }
+		return reply, ok
+	}
+	return AskWorkReply{}, ok
+}
+
+func CallForDone(doneWorkArgs DoneWorkArgs) (DoneWorkReply, error) {
+	reply := DoneWorkReply{}
+	ok := call("Coordinator.WorkDone", &doneWorkArgs,&reply)
+	if ok{
+		return reply, nil
+	}
+	return DoneWorkReply{}, errors.New("call done fail")
+}
+
 
 //
 // send an RPC request to the coordinator, wait for the response.

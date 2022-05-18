@@ -1,7 +1,7 @@
 package shardctrler
 
-import "6.824/labrpc"
-import "6.824/raft"
+import "Lab6824/labrpc"
+import "Lab6824/raft"
 import "testing"
 import "os"
 

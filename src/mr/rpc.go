@@ -20,7 +20,30 @@ type ExampleArgs struct {
 
 type ExampleReply struct {
 	Y int
+
 }
+
+type AskWorkArgs struct {
+	WorkId int
+}
+type AskWorkReply struct {
+	WorkId	 int
+	TaskId	int
+	Filenames []string
+	NReduce	 int
+	TaskType int // 1 for map  ; 2 for reduce ; 0 for wait ; -1 for close
+}
+
+type DoneWorkArgs struct {
+	// done workerID
+	TaskId int
+	WorkerId	int
+	Filepaths	[]string
+}
+type DoneWorkReply struct {
+	//
+}
+
 
 // Add your RPC definitions here.
 
