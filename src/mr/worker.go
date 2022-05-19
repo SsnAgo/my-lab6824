@@ -23,13 +23,13 @@ func (a ByKey) Len() int           { return len(a) }
 func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
-func ihash(key string) int {
+func ihash(key string) int64 {
 	h := fnv.New32a()
 	h.Write([]byte(key))
-	return int(h.Sum32() & 0x7fffffff)
+	return int64(h.Sum32() & 0x7fffffff)
 }
 
-var workerId int
+var workerId int64
 
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
@@ -120,7 +120,7 @@ func domap(mapf func(string, string) []KeyValue, reply AskWorkReply) (outfiles [
 	mrXYs := make([]*os.File, nReduce)
 	encs := make([]*json.Encoder, nReduce)
 	// init encoder and out-files
-	for i := 0; i < nReduce;i++ {
+	for i := 0; i < int(nReduce);i++ {
 		// delete old file
 		fname := fmt.Sprintf("*-mr-%d-%d", taskId, i)
 
@@ -135,7 +135,7 @@ func domap(mapf func(string, string) []KeyValue, reply AskWorkReply) (outfiles [
 		encs[i] = json.NewEncoder(mrXY)
 	}
 	defer func() {
-		for i := 0; i < nReduce;i++ {
+		for i := 0; i < int(nReduce);i++ {
 			mrXYs[i].Close()
 		}
 	}()
