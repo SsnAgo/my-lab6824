@@ -25,6 +25,7 @@ type DoneWorkArgs struct {
 	// done workerID
 	TaskId int64
 	WorkerId	int64
+	// output filenames
 	Filepaths	[]string
 }
 type DoneWorkReply struct {

@@ -29,6 +29,7 @@ func ihash(key string) int64 {
 	return int64(h.Sum32() & 0x7fffffff)
 }
 
+// save its worker id when first \call for work
 var workerId int64
 
 func Worker(mapf func(string, string) []KeyValue,

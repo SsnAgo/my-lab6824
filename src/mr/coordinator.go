@@ -14,7 +14,7 @@ import "net/rpc"
 import "net/http"
 
 type Coordinator struct {
-	// status, 0: alldone , 1: map, 2: reduce
+	// status, 0: all work done , 1: map, 2: reduce
 	Status int64 // 1:map  2:reduce
 	// amounts
 	NReduce     int64
@@ -24,9 +24,8 @@ type Coordinator struct {
 	DoneCount int64
 	// auto-inc worker id
 	NextWorkerId int64
-	// it the worker alive, if timeout then add the workerid to this map, if done workerid in this, ignore !
-	MapWorkerDead    sync.Map
-	ReduceWorkerDead sync.Map
+	// dead worker id
+	WorkerDead sync.Map
 	// taskId: taskFiles
 	MapTasks    sync.Map
 	ReduceTasks sync.Map
@@ -34,19 +33,24 @@ type Coordinator struct {
 	WorkingTasks sync.Map
 }
 
+// Task task info,
 type Task struct {
 	taskId    int64
 	taskFiles []string
 }
+
+// WorkingTask working works
 type WorkingTask struct {
 	worker int64
 	task   *Task
 }
 
+// WorkSend check c.Status and send corresponding task
 func (c *Coordinator) WorkSend(args *AskWorkArgs, reply *AskWorkReply) error {
 	var task *Task
-	// get worker id, if workerid is 0, assign a auto inc workerid
+	// get current phrase
 	status := atomic.LoadInt64(&c.Status)
+	// if 0, tell worker to exit
 	if status == 0 {
 		reply.TaskType = -1
 		return nil
@@ -60,7 +64,8 @@ func (c *Coordinator) WorkSend(args *AskWorkArgs, reply *AskWorkReply) error {
 	// do map or reduce
 	if status == 1 {
 		task = c.getMapTask(wid)
-	} else if status == 2 {
+	}
+	if status == 2 {
 		task = c.getReduceTask(wid)
 	}
 	// no more task
@@ -70,27 +75,35 @@ func (c *Coordinator) WorkSend(args *AskWorkArgs, reply *AskWorkReply) error {
 		return nil
 	}
 	// assignment reply
-	reply.NReduce = c.NReduce
-	reply.TaskType = status
-	reply.Filenames = task.taskFiles
-	reply.WorkId = wid
-	reply.TaskId = task.taskId
-	// add to working task
-	c.AddWorkingTask(wid, task, status)
+	{
+		reply.WorkId = wid
+		reply.TaskId = task.taskId
+		reply.NReduce = c.NReduce
+		// 1 for map, 2 for reduce
+		reply.TaskType = status
+		reply.Filenames = task.taskFiles
+
+	}
+	// add task to workingTasks, means
+	c.addWorkingTask(wid, task, status)
 
 	return nil
 }
+
+// WorkDone execute mapDone or reduceDone according to c.Status
 func (c *Coordinator) WorkDone(args *DoneWorkArgs, reply *DoneWorkReply) error {
 	// done this  delete the worker from working map
 	status := atomic.LoadInt64(&c.Status)
 	if status == 1 {
 		c.mapDone(args, reply)
-	} else if status == 2 {
+	}
+	if status == 2 {
 		c.reduceDone(args, reply)
 	}
 	return nil
 }
 
+// server start
 func (c *Coordinator) server() {
 	rpc.Register(c)
 	rpc.HandleHTTP()
@@ -105,10 +118,12 @@ func (c *Coordinator) server() {
 	go http.Serve(l, nil)
 }
 
+// Done check done
 func (c *Coordinator) Done() bool {
 	return atomic.LoadInt64(&c.Status) == 0
 }
 
+// MakeCoordinator init coordinator and tasks
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	mapTasks := sync.Map{}
 	for i, file := range files {
@@ -126,35 +141,28 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	}
 
 	c := Coordinator{
-		Status:           1,
-		NReduce:          int64(nReduce),
-		NMapTask:         int64(len(files)),
-		NReduceTask:      int64(nReduce),
-		DoneCount:        0,
-		NextWorkerId:     1,
-		MapWorkerDead:    sync.Map{},
-		ReduceWorkerDead: sync.Map{},
-		MapTasks:         mapTasks,
-		ReduceTasks:      reduceTasks,
-		WorkingTasks:     sync.Map{},
+		Status:       1,
+		NReduce:      int64(nReduce),
+		NMapTask:     int64(len(files)),
+		NReduceTask:  int64(nReduce),
+		DoneCount:    0,
+		NextWorkerId: 1,
+		WorkerDead:   sync.Map{},
+		MapTasks:     mapTasks,
+		ReduceTasks:  reduceTasks,
+		WorkingTasks: sync.Map{},
 	}
 	c.server()
 	return &c
 }
 
+// getReduceTask get reduce task from reduceTasks
 func (c *Coordinator) getReduceTask(wid int64) (task *Task) {
-	// check the wid if dead
-	if dead, ok := c.ReduceWorkerDead.Load(wid); ok && dead.(bool) {
+	// check if the worker dead
+	if c.isDead(wid) {
 		return nil
 	}
-	//c.reduceTaskLock.Lock()
-	//defer c.reduceTaskLock.Unlock()
-	//if len(c.ReduceTasks) > 0 {
-	//	// init task info
-	//	task = c.ReduceTasks[0]
-	//	// pop task
-	//	c.ReduceTasks = c.ReduceTasks[1:]
-	//}
+	// randomly assign one task
 	c.ReduceTasks.Range(func(key, value interface{}) bool {
 		task = value.(*Task)
 		return false
@@ -162,11 +170,13 @@ func (c *Coordinator) getReduceTask(wid int64) (task *Task) {
 	return task
 }
 
+// getMapTask get map task from reduceTasks
 func (c *Coordinator) getMapTask(wid int64) (task *Task) {
-	// check the wid is dead
-	if dead, ok := c.MapWorkerDead.Load(wid); ok && dead.(bool) {
+	// check if the worker dead
+	if c.isDead(wid) {
 		return nil
 	}
+	// randomly assign one task
 	c.MapTasks.Range(func(key, value interface{}) bool {
 		task = value.(*Task)
 		return false
@@ -174,22 +184,25 @@ func (c *Coordinator) getMapTask(wid int64) (task *Task) {
 	return task
 }
 
+// mapDone one map task done, and check if all map task done
 func (c *Coordinator) mapDone(args *DoneWorkArgs, reply *DoneWorkReply) {
 	// if done worker dead, ignore
-	if dead, ok := c.MapWorkerDead.Load(args.WorkerId); ok && dead.(bool) {
+	if c.isDead(args.WorkerId) {
 		return
 	}
-
 	mrXYs := args.Filepaths
-	// accept file changname   add task to reduceFiles
+	// accept file and chang name, add task to reduceFiles
 	doneTaskId := args.TaskId
 	for _, xy := range mrXYs {
 		Y, _ := strconv.Atoi(xy[strings.LastIndex(xy, "-")+1:])
 		newname := xy[strings.Index(xy, "-")+1:]
-
-		task, _ := c.ReduceTasks.Load(int64(Y))
-		task.(*Task).taskFiles = append(task.(*Task).taskFiles, newname)
-		c.ReduceTasks.Store(task.(*Task).taskId, task.(*Task))
+		// like this: ReduceTasks[i] = append(ReduceTasks[i], filename)
+		{
+			task, _ := c.ReduceTasks.Load(int64(Y))
+			task.(*Task).taskFiles = append(task.(*Task).taskFiles, newname)
+			c.ReduceTasks.Store(task.(*Task).taskId, task.(*Task))
+		}
+		// rename to mr-X-Y
 		os.Rename(xy, newname)
 	}
 	// done count ++
@@ -197,82 +210,98 @@ func (c *Coordinator) mapDone(args *DoneWorkArgs, reply *DoneWorkReply) {
 	// mark workdead in WorkingTasks, and free the slot to reuse
 	c.WorkingTasks.Delete(doneTaskId)
 	// check if all map task done
-	c.checkMapDone()
+	c.checkAllMapDone()
 }
 
+// reduceDone one reduce task done, and check if all reduce task done
 func (c *Coordinator) reduceDone(args *DoneWorkArgs, reply *DoneWorkReply) {
-	if dead, ok := c.ReduceWorkerDead.Load(args.WorkerId); ok && dead.(bool) {
+	// if done worker dead, ignore
+	if c.isDead(args.WorkerId) {
 		return
 	}
 	ofilename := args.Filepaths[0]
 	// doneTaskId == Y
 	doneTaskId := args.TaskId
-	// rename
+	// rename to mr-out-Y
 	os.Rename(ofilename, ofilename[strings.Index(ofilename, "-")+1:])
-	// remove from workingTasks, and add done count
+	// remove from workingTasks
 	c.WorkingTasks.Delete(doneTaskId)
+	// add done count
 	atomic.AddInt64(&c.DoneCount, 1)
 	// check if all reduce task done
-	c.checkReduceDone()
+	c.checkAllReduceDone()
 }
 
-func (c *Coordinator) checkMapDone() {
+// checkAllMapDone check and set status
+func (c *Coordinator) checkAllMapDone() {
 	if c.NMapTask == atomic.LoadInt64(&c.DoneCount) {
+		// reset done count
 		atomic.StoreInt64(&c.DoneCount, 0)
+		// alter c.Status to reduce phrase
 		atomic.StoreInt64(&c.Status, 2)
 	}
 }
 
-func (c *Coordinator) checkReduceDone() {
+// checkAllReduceDone check and set status
+func (c *Coordinator) checkAllReduceDone() {
 	if c.NReduceTask == atomic.LoadInt64(&c.DoneCount) {
-		atomic.StoreInt64(&c.DoneCount, 0)
+		// alter c.Status to reduce phrase
 		atomic.StoreInt64(&c.Status, 0)
 	}
 }
 
-func (c *Coordinator) AddWorkingTask(wid int64, task *Task, status int64) {
+// addWorkingTask add task to workingTasks
+func (c *Coordinator) addWorkingTask(wid int64, task *Task, status int64) {
+	// add to workingTasks
 	c.WorkingTasks.Store(task.taskId, &WorkingTask{
 		worker: wid,
 		task:   task,
 	})
 	if status == 1 {
 		c.MapTasks.Delete(task.taskId)
+		// run a goroutine to check if timeout or crash
 		go c.recycleMapTask(wid, task.taskId)
-	} else if status == 2 {
+	}
+	if status == 2 {
 		c.ReduceTasks.Delete(task.taskId)
+		// run a goroutine to check if timeout or crash
 		go c.recycleReduceTask(wid, task.taskId)
 	}
 }
 
+// recycleMapTask if worker not dont when timeout, recycle task to c.MapTasks
 func (c *Coordinator) recycleMapTask(wid, tid int64) {
+	// sleep 10 seconds when the task start
 	time.Sleep(10 * time.Second)
-	if _, ok := c.WorkingTasks.Load(tid); !ok {
+	// after 10 seconds, check if the task done, if done , return
+	task, ok := c.WorkingTasks.LoadAndDelete(tid)
+	if !ok {
 		return
 	}
-
-	c.MapWorkerDead.Store(wid, true)
-	// delete from working map
-	task, _ := c.WorkingTasks.LoadAndDelete(tid)
-	if task == nil {
-		return
-	}
-	// recycle task
+	// come head means not done yet, we can say the worker crashed or too slow to complete the task
+	// so add the workerId to MapDead
+	c.WorkerDead.Store(wid, true)
+	// recycle map task
 	c.MapTasks.Store(task.(*WorkingTask).task.taskId, task.(*WorkingTask).task)
 }
-
+// recycleReduceTask if worker not dont when timeout, recycle task to c.ReduceTasks
 func (c *Coordinator) recycleReduceTask(wid int64, tid int64) {
 	time.Sleep(10 * time.Second)
-	// check if the task done, if done , return ; else do recycle; its important
-	if _, ok := c.WorkingTasks.Load(tid); !ok {
-		return
-	}
-
-	c.ReduceWorkerDead.Store(wid, true)
 	// delete from working map
-	task, _ := c.WorkingTasks.LoadAndDelete(tid)
-	if task == nil {
+	// after 10 seconds, check if the task done, if done, return
+	task, ok := c.WorkingTasks.LoadAndDelete(tid)
+	if !ok {
 		return
 	}
-	// recycle task
+	// come head means not done yet, we can say the worker crashed or too slow to complete the task
+	// so add the workerId to MapDead
+	c.WorkerDead.Store(wid, true)
+	// recycle reduce task
 	c.ReduceTasks.Store(task.(*WorkingTask).task.taskId, task.(*WorkingTask).task)
+}
+
+// isDead return if worker is dead
+func (c *Coordinator) isDead(wid int64) bool {
+	dead, ok := c.WorkerDead.Load(wid)
+	return ok && dead.(bool)
 }
